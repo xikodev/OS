@@ -1,4 +1,4 @@
-# Lab 2 Testing Guide
+yy# Lab 2 Testing Guide
 
 This file explains how to build and test the Lab 2 shell implementation in [shell.c](/C:/Users/borna/CLionProjects/OS/lab02/shell.c).
 
