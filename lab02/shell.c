@@ -46,7 +46,9 @@ static void trim_spaces(char *text)
 
     if (i > 0) {
         while (text[i] != '\0') {
-            text[j++] = text[i++];
+            text[j] = text[i];
+            j++;
+            i++;
         }
         text[j] = '\0';
     }
@@ -89,7 +91,7 @@ static void print_history(void)
 static void add_process(pid_t pid, const char *command)
 {
     if (process_count >= MAX_PROCESSES) {
-        fprintf(stderr, "Too many processes in table\n");
+        fprintf(stderr, "Too many proceses in table\n");
         return;
     }
 
@@ -189,7 +191,7 @@ static void setup_signals(void)
     signal(SIGTTIN, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
 }
-on
+
 static void setup_shell(void)
 {
     interactive_shell = isatty(STDIN_FILENO);
@@ -248,7 +250,7 @@ static int parse_command(char *line, char *argv[])
             while (line[i] != '\0' && line[i] != quote) {
                 line[start + j] = line[i];
                 i++;
-                j++;
+                j = j + 1;
             }
 
             if (line[i] != quote) {
@@ -283,7 +285,7 @@ static int is_background_command(char *argv[], int *argc)
 {
     if (*argc > 0 && strcmp(argv[*argc - 1], "&") == 0) {
         argv[*argc - 1] = NULL;
-        (*argc)--;
+        *argc = *argc - 1;
         return 1;
     }
 
@@ -324,7 +326,7 @@ static int builtin_kill(char *argv[], int argc)
     char *endptr;
 
     if (argc != 3) {
-        fprintf(stderr, "Usage: kill <pid> <signal>\n");
+        fprintf(stderr, "Usge: kill <pid> <signal>\n");
         return 1;
     }
 
@@ -458,7 +460,7 @@ int main(void)
         if (line[0] == '!') {
             history_number = (int)strtol(line + 1, &endptr, 10);
             if (*endptr != '\0' || history_number <= 0 || history_number > history_count) {
-                fprintf(stderr, "Invalid history reference: %s\n", line);
+                fprintf(stderr, "Invald history reference: %s\n", line);
                 continue;
             }
 
