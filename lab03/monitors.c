@@ -1,3 +1,4 @@
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
@@ -6,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 #include <time.h>
 
 #define TEAM_COUNT 2
@@ -13,486 +15,405 @@
 #define MECHANICS_PER_TEAM 4
 
 typedef struct {
-    int team_id;
-    int member_id;
+    int team;
+    int num;
     unsigned int seed;
-} ThreadArgs;
+} Info;
 
 typedef struct {
-    pthread_mutex_t mutex;
+    pthread_mutex_t m;
     pthread_cond_t driver_cv;
     pthread_cond_t mechanic_cv;
     pthread_cond_t flag_cv;
-    int team_id;
-    int waiting_drivers;
+    int team;
+    int waiting;
     int next_ticket;
-    int ticket_to_enter;
-    bool pit_reserved;
-    bool driver_in_pit;
-    bool service_active;
-    bool service_done;
-    int mechanics_remaining;
-    int service_cycle;
-} TeamMonitor;
+    int turn;
+    int pit_open;
+    int in_pit;
+    int busy;
+    int working;
+    int done;
+    int cycle;
+    int finished_mechanics;
+} Pit;
 
-static TeamMonitor teams[TEAM_COUNT];
-static pthread_mutex_t race_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t race_start_cv = PTHREAD_COND_INITIALIZER;
-static bool race_started = false;
-static bool race_running = true;
-static int finished_drivers = 0;
+static Pit pits[TEAM_COUNT];
+static pthread_mutex_t start_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t start_cv = PTHREAD_COND_INITIALIZER;
+static int started = 0;
+static int running = 1;
+static int finished = 0;
 
-static void die_pthread(int code, const char *what)
-{
-    fprintf(stderr, "%s: %s\n", what, strerror(code));
-    exit(EXIT_FAILURE);
+static void fail(const char *s) {
+    perror(s);
+    exit(1);
 }
 
-static void lock_mutex(pthread_mutex_t *mutex, const char *what)
-{
-    int code = pthread_mutex_lock(mutex);
+static void check(int code, const char *s) {
     if (code != 0) {
-        die_pthread(code, what);
+        fprintf(stderr, "%s: %s\n", s, strerror(code));
+        exit(1);
     }
 }
 
-static void unlock_mutex(pthread_mutex_t *mutex, const char *what)
-{
-    int code = pthread_mutex_unlock(mutex);
-    if (code != 0) {
-        die_pthread(code, what);
-    }
-}
 
-static void wait_cond(pthread_cond_t *cond, pthread_mutex_t *mutex, const char *what)
-{
-    int code = pthread_cond_wait(cond, mutex);
-    if (code != 0) {
-        die_pthread(code, what);
-    }
-}
-
-static void signal_cond(pthread_cond_t *cond, const char *what)
-{
-    int code = pthread_cond_signal(cond);
-    if (code != 0) {
-        die_pthread(code, what);
-    }
-}
-
-static void broadcast_cond(pthread_cond_t *cond, const char *what)
-{
-    int code = pthread_cond_broadcast(cond);
-    if (code != 0) {
-        die_pthread(code, what);
-    }
-}
-
-static void sleep_ms(int ms)
-{
+static void sleep_ms(int ms) {
     struct timespec req;
     struct timespec rem;
-
     req.tv_sec = ms / 1000;
     req.tv_nsec = (long)(ms % 1000) * 1000000L;
 
     while (nanosleep(&req, &rem) == -1) {
         if (errno != EINTR) {
-            perror("nanosleep");
-            exit(EXIT_FAILURE);
-        }
+            fail("nanosleep");
+    }
         req = rem;
     }
 }
 
-static int random_range(unsigned int *seed, int min_value, int max_value)
-{
-    return min_value + (int)(rand_r(seed) % (unsigned int)(max_value - min_value + 1));
+static unsigned int next_rand(unsigned int *seed) {
+    *seed = *seed * 1664525u + 1013904223u;
+    return *seed;
+}
+static int rand_between(unsigned int *seed, int a, int b) {
+    return a + (int)(next_rand(seed) % (unsigned int)(b - a + 1));
+}
+static unsigned int make_seed(unsigned int base, int team, int num, int add) {
+    return base + (unsigned int)(team * 97 + num * 31 + add * 17 + 11);
+}
+static void drive(Info *x, int ms) {
+    printf("TEAM %d DRIVER %d driving for %d ms\n", x->team, x->num, ms);
+    fflush(stdout);
+    sleep_ms(ms);
 }
 
-static void wait_for_race_start(void)
-{
-    lock_mutex(&race_mutex, "pthread_mutex_lock race_mutex");
-    while (!race_started) {
-        wait_cond(&race_start_cv, &race_mutex, "pthread_cond_wait race_start_cv");
+
+
+static void stop_race(void){
+    int i;
+
+    for (i = 0; i < TEAM_COUNT; i++) {
+        check(pthread_mutex_lock(&pits[i].m), "pthread_mutex_lock");
+        check(pthread_cond_broadcast(&pits[i].driver_cv), "pthread_cond_broadcast");
+        check(pthread_cond_broadcast(&pits[i].mechanic_cv), "pthread_cond_broadcast");
+        check(pthread_cond_broadcast(&pits[i].flag_cv), "pthread_cond_broadcast");
+
+        check(pthread_mutex_unlock(&pits[i].m), "pthread_mutex_unlock");
     }
-    unlock_mutex(&race_mutex, "pthread_mutex_unlock race_mutex");
 }
 
-static void maybe_finish_race(void)
-{
-    int team;
+static void wait_start(void) {
+    check(pthread_mutex_lock(&start_m), "pthread_mutex_lock");
 
-    lock_mutex(&race_mutex, "pthread_mutex_lock race_mutex");
-    finished_drivers++;
-    if (finished_drivers == TEAM_COUNT * DRIVERS_PER_TEAM) {
-        race_running = false;
-        unlock_mutex(&race_mutex, "pthread_mutex_unlock race_mutex");
-
-        for (team = 0; team < TEAM_COUNT; team++) {
-            lock_mutex(&teams[team].mutex, "pthread_mutex_lock team mutex");
-            broadcast_cond(&teams[team].driver_cv, "pthread_cond_broadcast driver_cv");
-            broadcast_cond(&teams[team].mechanic_cv, "pthread_cond_broadcast mechanic_cv");
-            broadcast_cond(&teams[team].flag_cv, "pthread_cond_broadcast flag_cv");
-            unlock_mutex(&teams[team].mutex, "pthread_mutex_unlock team mutex");
-        }
-        return;
+    while (!started) {
+        check(pthread_cond_wait(&start_cv, &start_m), "pthread_cond_wait");
     }
-    unlock_mutex(&race_mutex, "pthread_mutex_unlock race_mutex");
+
+    check(pthread_mutex_unlock(&start_m), "pthread_mutex_unlock");
+}
+static int race_running(void){
+    int value;
+
+    check(pthread_mutex_lock(&start_m), "pthread_mutex_lock");
+    value = running;
+    check(pthread_mutex_unlock(&start_m), "pthread_mutex_unlock");
+    return value;
 }
 
-static bool is_race_running(void)
-{
-    bool running_now;
 
-    lock_mutex(&race_mutex, "pthread_mutex_lock race_mutex");
-    running_now = race_running;
-    unlock_mutex(&race_mutex, "pthread_mutex_unlock race_mutex");
-    return running_now;
-}
+static void driver_pit_stop(int team_index, int driver_num)
+ {
+    Pit *p = &pits[team_index];
+    int ticket;
 
-static void request_pit_stop(int team_index, int driver_id)
-{
-    TeamMonitor *team = &teams[team_index];
-    int my_ticket;
+    check(pthread_mutex_lock(&p->m), "pthread_mutex_lock");
 
-    lock_mutex(&team->mutex, "pthread_mutex_lock team mutex");
+    ticket = p->next_ticket;
+    p->next_ticket++;
+    p->waiting++;
 
-    my_ticket = team->next_ticket;
-    team->next_ticket++;
-    team->waiting_drivers++;
-    printf("TEAM %d DRIVER %d waiting for pit stop\n", team->team_id, driver_id);
+    printf("TEAM %d DRIVER %d waiting for pitstop\n", p->team, driver_num);
     fflush(stdout);
 
-    signal_cond(&team->flag_cv, "pthread_cond_signal flag_cv");
+    check(pthread_cond_signal(&p->flag_cv), "pthread_cond_signal");
 
-    while (is_race_running() && (!team->pit_reserved || team->ticket_to_enter != my_ticket)) {
-        wait_cond(&team->driver_cv, &team->mutex, "pthread_cond_wait driver_cv");
+    while (race_running() && (!p->pit_open || p->turn != ticket)) {
+        check(pthread_cond_wait(&p->driver_cv, &p->m), "pthread_cond_wait");
     }
 
-    if (!is_race_running()) {
-        unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+    if (!race_running()) {
+        check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
         return;
     }
 
-    team->waiting_drivers--;
-    team->driver_in_pit = true;
-    printf("TEAM %d DRIVER %d entered pit\n", team->team_id, driver_id);
-    fflush(stdout);
-    signal_cond(&team->flag_cv, "pthread_cond_signal flag_cv");
+    p->waiting--;
+    p->pit_open = 0;
+    p->busy = 1;
+    p->in_pit = 1;
 
-    while (is_race_running() && !team->service_done) {
-        wait_cond(&team->driver_cv, &team->mutex, "pthread_cond_wait driver_cv");
+    printf("TEAM %d  DRIVER %d entered pit\n", p->team, driver_num);
+    fflush(stdout);
+
+    check(pthread_cond_signal(&p->flag_cv), "pthread_cond_signal");
+
+    while (race_running() && !p->done) {
+        check(pthread_cond_wait(&p->driver_cv, &p->m), "pthread_cond_wait");
     }
 
-    if (team->service_done) {
-        printf("TEAM %d DRIVER %d leaving pit\n", team->team_id, driver_id);
+    if (p->done) {
+        printf("TEAM %d DRIVER  %d leaving pit\n", p->team, driver_num);
         fflush(stdout);
-        team->service_done = false;
-        team->driver_in_pit = false;
-        team->pit_reserved = false;
-        team->ticket_to_enter++;
-        signal_cond(&team->flag_cv, "pthread_cond_signal flag_cv");
+
+        p->done = 0;
+        p->in_pit = 0;
+        p->busy = 0;
+        p->turn++;
+
+        check(pthread_cond_signal(&p->flag_cv), "pthread_cond_signal");
     }
 
-    unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+    check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
 }
 
-static void *driver_thread(void *arg)
-{
-    ThreadArgs *info = (ThreadArgs *)arg;
-    int first_drive;
-    int second_drive;
-    int final_drive;
 
-    wait_for_race_start();
 
-    first_drive = random_range(&info->seed, 2000, 5000);
-    second_drive = 7000 - first_drive;
-    final_drive = random_range(&info->seed, 2000, 3000);
+static void *driver(void *arg) {
+    Info *x = (Info *)arg;
+    int t1;
+    int t2;
+    int t3;
 
-    printf("TEAM %d DRIVER %d driving for %d ms\n", info->team_id, info->member_id, first_drive);
+    wait_start();
+
+    t1 = rand_between(&x->seed, 2000, 5000);
+    t2 = 7000 - t1;
+    t3 = rand_between(&x->seed, 2000, 3000);
+
+    drive(x, t1);
+    driver_pit_stop(x->team - 1, x->num);
+    drive(x, t2);
+    driver_pit_stop(x->team - 1, x->num);
+    drive(x, t3);
+    printf("TEAM %d DRIVER %d finnished race\n", x->team, x->num);
     fflush(stdout);
-    sleep_ms(first_drive);
 
-    request_pit_stop(info->team_id - 1, info->member_id);
+    {
+        int last = 0;
+        check(pthread_mutex_lock(&start_m), "pthread_mutex_lock");
+        finished++;
+        if (finished == TEAM_COUNT * DRIVERS_PER_TEAM) {
+            running = 0;
+            last = 1;
+        }
+        check(pthread_mutex_unlock(&start_m), "pthread_mutex_unlock");
+        if (last) {
+                stop_race();
+        }
+    }
 
-    printf("TEAM %d DRIVER %d driving for %d ms\n", info->team_id, info->member_id, second_drive);
-    fflush(stdout);
-    sleep_ms(second_drive);
-
-    request_pit_stop(info->team_id - 1, info->member_id);
-
-    printf("TEAM %d DRIVER %d driving for %d ms\n", info->team_id, info->member_id, final_drive);
-    fflush(stdout);
-    sleep_ms(final_drive);
-
-    printf("TEAM %d DRIVER %d finished race\n", info->team_id, info->member_id);
-    fflush(stdout);
-    maybe_finish_race();
     return NULL;
 }
 
-static void *mechanic_thread(void *arg)
-{
-    ThreadArgs *info = (ThreadArgs *)arg;
-    TeamMonitor *team = &teams[info->team_id - 1];
+
+static void *mechanic(void *arg) {
+    Info *x = (Info *)arg;
+    Pit *p = &pits[x->team - 1];
     int last_cycle = 0;
 
-    wait_for_race_start();
+    wait_start();
 
     while (1) {
-        int cycle_to_process;
-        int work_time;
+        int my_cycle;
+        int ms;
+        check(pthread_mutex_lock(&p->m), "pthread_mutex_lock");
 
-        lock_mutex(&team->mutex, "pthread_mutex_lock team mutex");
-        while (race_running && (!team->service_active || team->service_cycle == last_cycle)) {
-            wait_cond(&team->mechanic_cv, &team->mutex, "pthread_cond_wait mechanic_cv");
+        while (running && (!p->working || p->cycle == last_cycle)) {
+            check(pthread_cond_wait(&p->mechanic_cv, &p->m), "pthread_cond_wait");
         }
-
-        if (!race_running) {
-            unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+        if (!running) {
+            check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
             break;
         }
 
-        cycle_to_process = team->service_cycle;
-        unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
-
-        work_time = random_range(&info->seed, 2000, 4000);
-        printf("TEAM %d MECHANIC %d changing wheel for %d ms\n",
-               info->team_id, info->member_id, work_time);
+        my_cycle = p->cycle;
+        check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
+        ms = rand_between(&x->seed, 2000, 4000);
+        printf("TEAM %d MECANIC %d changing wheel for %d ms\n", x->team, x->num, ms);
         fflush(stdout);
-        sleep_ms(work_time);
+        sleep_ms(ms);
 
-        lock_mutex(&team->mutex, "pthread_mutex_lock team mutex");
-        if (team->service_active && team->service_cycle == cycle_to_process && last_cycle != cycle_to_process) {
-            team->mechanics_remaining--;
-            last_cycle = cycle_to_process;
+        check(pthread_mutex_lock(&p->m), "pthread_mutex_lock");
+
+        if (p->working && p->cycle == my_cycle && last_cycle != my_cycle) {
+            p->finished_mechanics++;
+            last_cycle = my_cycle;
+
             printf("TEAM %d MECHANIC %d finished wheel, remaining %d\n",
-                   info->team_id, info->member_id, team->mechanics_remaining);
+                   x->team, x->num, MECHANICS_PER_TEAM - p->finished_mechanics);
             fflush(stdout);
-            if (team->mechanics_remaining == 0) {
-                signal_cond(&team->flag_cv, "pthread_cond_signal flag_cv");
+
+            if (p->finished_mechanics == MECHANICS_PER_TEAM) {
+                check(pthread_cond_signal(&p->flag_cv), "pthread_cond_signal");
             }
         }
-        unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+        check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
     }
 
-    printf("TEAM %d MECHANIC %d stopping\n", info->team_id, info->member_id);
+    printf("TEAM %d MECHANIC %d stopping\n", x->team, x->num);
     fflush(stdout);
     return NULL;
 }
+static void *flag_person(void *arg)  {
+    Info *x = (Info *)arg;
+    Pit *p = &pits[x->team - 1];
 
-static void *flag_thread(void *arg)
-{
-    ThreadArgs *info = (ThreadArgs *)arg;
-    TeamMonitor *team = &teams[info->team_id - 1];
 
-    wait_for_race_start();
+    wait_start();
 
     while (1) {
-        lock_mutex(&team->mutex, "pthread_mutex_lock team mutex");
+        check(pthread_mutex_lock(&p->m), "pthread_mutex_lock");
 
-        while (race_running && team->waiting_drivers == 0) {
-            wait_cond(&team->flag_cv, &team->mutex, "pthread_cond_wait flag_cv");
+
+        while (running && p->waiting == 0) {
+            check(pthread_cond_wait(&p->flag_cv, &p->m), "pthread_cond_wait");
         }
-        if (!race_running) {
-            unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+        if (!running) {
+            check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
             break;
         }
-
-        while (race_running && team->pit_reserved) {
-            wait_cond(&team->flag_cv, &team->mutex, "pthread_cond_wait flag_cv");
+        while (running && p->busy) {
+            check(pthread_cond_wait(&p->flag_cv, &p->m), "pthread_cond_wait");
         }
-        if (!race_running) {
-            unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+        if (!running) {
+            check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
             break;
         }
-
-        team->pit_reserved = true;
-        printf("TEAM %d FLAG: raised, driver may enter pit\n", info->team_id);
+        p->pit_open = 1;
+        printf("TEAM %d FLAG: raised, driver may enter pit\n", x->team);
         fflush(stdout);
-        broadcast_cond(&team->driver_cv, "pthread_cond_broadcast driver_cv");
 
-        while (race_running && !team->driver_in_pit) {
-            wait_cond(&team->flag_cv, &team->mutex, "pthread_cond_wait flag_cv");
+        check(pthread_cond_broadcast(&p->driver_cv), "pthread_cond_broadcast");
+
+        while (running && !p->in_pit) {
+            check(pthread_cond_wait(&p->flag_cv, &p->m), "pthread_cond_wait");
         }
-        if (!race_running) {
-            unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+        if (!running) {
+            check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
             break;
         }
+        p->working = 1;
+        p->cycle++;
+        p->finished_mechanics = 0;
 
-        printf("TEAM %d FLAG: lowered, mechanics start\n", info->team_id);
+
+        printf("TEAM %d FLAG: lowered, mechanics start\n", x->team);
         fflush(stdout);
-        team->service_active = true;
-        team->mechanics_remaining = MECHANICS_PER_TEAM;
-        team->service_cycle++;
-        broadcast_cond(&team->mechanic_cv, "pthread_cond_broadcast mechanic_cv");
+        check(pthread_cond_broadcast(&p->mechanic_cv), "pthread_cond_broadcast");
 
-        while (race_running && team->mechanics_remaining > 0) {
-            wait_cond(&team->flag_cv, &team->mutex, "pthread_cond_wait flag_cv");
+        while (running && p->finished_mechanics < MECHANICS_PER_TEAM) {
+            check(pthread_cond_wait(&p->flag_cv, &p->m), "pthread_cond_wait");
         }
-        if (!race_running) {
-            unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+        if (!running) {
+            check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
             break;
         }
+        p->working = 0;
+        p->done = 1;
 
-        team->service_active = false;
-        team->service_done = true;
-        printf("TEAM %d FLAG: raised, driver released\n", info->team_id);
+        printf("TEAM %d FLAG: raised, driver released\n", x->team);
         fflush(stdout);
-        broadcast_cond(&team->driver_cv, "pthread_cond_broadcast driver_cv");
 
-        while (race_running && team->pit_reserved) {
-            wait_cond(&team->flag_cv, &team->mutex, "pthread_cond_wait flag_cv");
+        check(pthread_cond_broadcast(&p->driver_cv), "pthread_cond_broadcast");
+        while (running && p->busy) {
+            check(pthread_cond_wait(&p->flag_cv, &p->m), "pthread_cond_wait");
         }
 
-        unlock_mutex(&team->mutex, "pthread_mutex_unlock team mutex");
+
+        check(pthread_mutex_unlock(&p->m), "pthread_mutex_unlock");
     }
-
-    printf("TEAM %d FLAG: stopping\n", info->team_id);
+    printf("TEAM %d FLAG stoping\n", x->team);
     fflush(stdout);
     return NULL;
 }
 
-static void initialize_team(TeamMonitor *team, int team_id)
-{
-    memset(team, 0, sizeof(*team));
-    team->team_id = team_id;
-    team->next_ticket = 1;
-    team->ticket_to_enter = 1;
-
-    {
-        int code = pthread_mutex_init(&team->mutex, NULL);
-        if (code != 0) {
-            die_pthread(code, "pthread_mutex_init");
-        }
-    }
-    {
-        int code = pthread_cond_init(&team->driver_cv, NULL);
-        if (code != 0) {
-            die_pthread(code, "pthread_cond_init driver_cv");
-        }
-    }
-    {
-        int code = pthread_cond_init(&team->mechanic_cv, NULL);
-        if (code != 0) {
-            die_pthread(code, "pthread_cond_init mechanic_cv");
-        }
-    }
-    {
-        int code = pthread_cond_init(&team->flag_cv, NULL);
-        if (code != 0) {
-            die_pthread(code, "pthread_cond_init flag_cv");
-        }
-    }
-}
-
-static void destroy_team(TeamMonitor *team)
-{
-    int code;
-
-    code = pthread_mutex_destroy(&team->mutex);
-    if (code != 0) {
-        die_pthread(code, "pthread_mutex_destroy");
-    }
-    code = pthread_cond_destroy(&team->driver_cv);
-    if (code != 0) {
-        die_pthread(code, "pthread_cond_destroy driver_cv");
-    }
-    code = pthread_cond_destroy(&team->mechanic_cv);
-    if (code != 0) {
-        die_pthread(code, "pthread_cond_destroy mechanic_cv");
-    }
-    code = pthread_cond_destroy(&team->flag_cv);
-    if (code != 0) {
-        die_pthread(code, "pthread_cond_destroy flag_cv");
-    }
-}
-
-int main(void)
-{
+int main(void){
     pthread_t drivers[TEAM_COUNT][DRIVERS_PER_TEAM];
     pthread_t mechanics[TEAM_COUNT][MECHANICS_PER_TEAM];
+
     pthread_t flags[TEAM_COUNT];
-    ThreadArgs driver_args[TEAM_COUNT][DRIVERS_PER_TEAM];
-    ThreadArgs mechanic_args[TEAM_COUNT][MECHANICS_PER_TEAM];
-    ThreadArgs flag_args[TEAM_COUNT];
-    unsigned int base_seed = (unsigned int)time(NULL);
-    int team;
-    int member;
-    int code;
+    Info d[TEAM_COUNT][DRIVERS_PER_TEAM];
+    Info m[TEAM_COUNT][MECHANICS_PER_TEAM];
+    Info f[TEAM_COUNT];
 
-    for (team = 0; team < TEAM_COUNT; team++) {
-        initialize_team(&teams[team], team + 1);
+    unsigned int base = (unsigned int)time(NULL);
+    int i;
+    int j;
+
+    for (i = 0; i < TEAM_COUNT; i++) {
+        memset(&pits[i], 0, sizeof(pits[i]));
+        pits[i].team = i + 1;
+        pits[i].next_ticket = 1;
+        pits[i].turn = 1;
+        check(pthread_mutex_init(&pits[i].m, NULL), "pthread_mutex_init");
+        check(pthread_cond_init(&pits[i].driver_cv, NULL), "pthread_cond_init");
+        check(pthread_cond_init(&pits[i].mechanic_cv, NULL), "pthread_cond_init");
+        check(pthread_cond_init(&pits[i].flag_cv, NULL), "pthread_cond_init");
+    }
+    for (i = 0; i < TEAM_COUNT; i++) {
+        for (j = 0; j < DRIVERS_PER_TEAM; j++) {
+            d[i][j].team = i + 1;
+            d[i][j].num = j + 1;
+            d[i][j].seed = make_seed(base, i + 1, j + 1, 1);
+            check(pthread_create(&drivers[i][j], NULL, driver, &d[i][j]), "pthread_create");
+        }
+        for (j = 0; j < MECHANICS_PER_TEAM; j++) {
+            m[i][j].team = i + 1;
+            m[i][j].num = j + 1;
+            m[i][j].seed = make_seed(base, i + 1, j + 1, 50);
+            check(pthread_create(&mechanics[i][j], NULL, mechanic, &m[i][j]), "pthread_create");
+        }
+
+        f[i].team = i + 1;
+        f[i].num = 1;
+        f[i].seed = make_seed(base, i + 1, 1, 90);
+        check(pthread_create(&flags[i], NULL, flag_person, &f[i]), "pthread_create");
     }
 
-    for (team = 0; team < TEAM_COUNT; team++) {
-        for (member = 0; member < DRIVERS_PER_TEAM; member++) {
-            driver_args[team][member].team_id = team + 1;
-            driver_args[team][member].member_id = member + 1;
-            driver_args[team][member].seed = base_seed + (unsigned int)(team * 100 + member * 7 + 1);
-            code = pthread_create(&drivers[team][member], NULL, driver_thread, &driver_args[team][member]);
-            if (code != 0) {
-                die_pthread(code, "pthread_create driver");
-            }
-        }
-
-        for (member = 0; member < MECHANICS_PER_TEAM; member++) {
-            mechanic_args[team][member].team_id = team + 1;
-            mechanic_args[team][member].member_id = member + 1;
-            mechanic_args[team][member].seed = base_seed + (unsigned int)(team * 100 + member * 11 + 50);
-            code = pthread_create(&mechanics[team][member], NULL, mechanic_thread, &mechanic_args[team][member]);
-            if (code != 0) {
-                die_pthread(code, "pthread_create mechanic");
-            }
-        }
-
-        flag_args[team].team_id = team + 1;
-        flag_args[team].member_id = 1;
-        flag_args[team].seed = base_seed + (unsigned int)(team * 100 + 90);
-        code = pthread_create(&flags[team], NULL, flag_thread, &flag_args[team]);
-        if (code != 0) {
-            die_pthread(code, "pthread_create flag");
-        }
-    }
-
-    printf("Race setup complete: 6 drivers, 8 mechanics, 2 flag persons\n");
-    printf("Race started\n");
+    printf("Race setup complete: 6 drivers, 8mechanics, 2 flag persons \n");
+    printf("Race started!! \n");
     fflush(stdout);
+    check(pthread_mutex_lock(&start_m), "pthread_mutex_lock");
+    started = 1;
+    check(pthread_cond_broadcast(&start_cv), "pthread_cond_broadcast");
 
-    lock_mutex(&race_mutex, "pthread_mutex_lock race_mutex");
-    race_started = true;
-    broadcast_cond(&race_start_cv, "pthread_cond_broadcast race_start_cv");
-    unlock_mutex(&race_mutex, "pthread_mutex_unlock race_mutex");
+    check(pthread_mutex_unlock(&start_m), "pthread_mutex_unlock");
 
-    for (team = 0; team < TEAM_COUNT; team++) {
-        for (member = 0; member < DRIVERS_PER_TEAM; member++) {
-            code = pthread_join(drivers[team][member], NULL);
-            if (code != 0) {
-                die_pthread(code, "pthread_join driver");
-            }
+    for (i = 0; i < TEAM_COUNT; i++) {
+        for (j = 0; j < DRIVERS_PER_TEAM; j++) {
+            check(pthread_join(drivers[i][j], NULL), "pthread_join");
         }
     }
+    for (i = 0; i < TEAM_COUNT; i++) {
+        check(pthread_join(flags[i], NULL), "pthread_join");
 
-    for (team = 0; team < TEAM_COUNT; team++) {
-        code = pthread_join(flags[team], NULL);
-        if (code != 0) {
-            die_pthread(code, "pthread_join flag");
-        }
-
-        for (member = 0; member < MECHANICS_PER_TEAM; member++) {
-            code = pthread_join(mechanics[team][member], NULL);
-            if (code != 0) {
-                die_pthread(code, "pthread_join mechanic");
-            }
+        for (j = 0; j < MECHANICS_PER_TEAM; j++) {
+            check(pthread_join(mechanics[i][j], NULL), "pthread_join");
         }
     }
+    for (i = 0; i < TEAM_COUNT; i++) {
+        check(pthread_mutex_destroy(&pits[i].m), "pthread_mutex_destroy");
 
-    for (team = 0; team < TEAM_COUNT; team++) {
-        destroy_team(&teams[team]);
+        check(pthread_cond_destroy(&pits[i].driver_cv), "pthread_cond_destroy");
+
+        check(pthread_cond_destroy(&pits[i].mechanic_cv), "pthread_cond_destroy");
+        check(pthread_cond_destroy(&pits[i].flag_cv), "pthread_cond_destroy");
     }
 
     printf("Race finished\n");
-    return EXIT_SUCCESS;
+
+    return 0;
 }
+
+
+
