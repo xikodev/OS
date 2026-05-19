@@ -6,30 +6,30 @@
 
 #define PAGE_SIZE 256
 #define OFFSET_BITS 8
-#define MAX_VPAGES 8
+#define MAX_PAGES 8
 #define MAX_PROCESSES 5
 #define MAX_FRAMES 12
 
 typedef struct {
     bool present;
     int frame;
-} PageTableEntry;
+} PageEntry;
 
 typedef struct {
     int pid;
-    int allocated_pages;
+    int num_pages;
     bool alive;
-    int requests_generated;
-    PageTableEntry pages[MAX_VPAGES];
-    unsigned char disk[MAX_VPAGES][PAGE_SIZE];
+    int requests;
+    PageEntry page_table[MAX_PAGES];
+    unsigned char disk[MAX_PAGES][PAGE_SIZE];
 } Process;
 
 typedef struct {
-    bool occupied;
+    bool used;
     bool dirty;
     int pid;
     int page;
-    unsigned char data[PAGE_SIZE];
+    unsigned char bytes[PAGE_SIZE];
 } Frame;
 
 typedef struct {
@@ -37,105 +37,57 @@ typedef struct {
     int page;
     int offset;
     unsigned char value;
-} Access;
+} Request;
 
-static Process processes[MAX_PROCESSES];
-static Frame frames[MAX_FRAMES];
-static int clock_bits[MAX_FRAMES];
+Process processes[MAX_PROCESSES];
+Frame memory_frames[MAX_FRAMES];
+int clock_ref[MAX_FRAMES];
 
-static int process_count;
-static int frame_count;
-static int clock_hand;
-static unsigned int rng_state;
+int n = 0;
+int m = 0;
+int hand = 0;
 
-static void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [seed] [steps] [processes] [frames]\n", prog);
-    fprintf(stderr, "All arguments are optional. Without them the simulation is randomized.\n");
+static int random_between(int a, int b) {
+    /* obican random broj u intervalu */
+    return a+rand()%(b-a+1);
 }
 
-static void fail(const char *msg) {
-    fprintf(stderr, "%s\n", msg);
-    exit(EXIT_FAILURE);
+static bool random_percent(int p) {
+    return random_between(1, 100) <= p;
 }
 
-static int parse_arg(const char *text, const char *name, int min_value, int max_value) {
+static void print_usage(const char *prog) {
+    printf("Usage: %s [seed] [steps] [processes] [frames]\n", prog);
+}
+
+static int read_number(const char *text, int min, int max, const char *what) {
     char *end = NULL;
-    long value = strtol(text, &end, 10);
+    long x = strtol(text, &end, 10);
 
+    /* provjera argumenta iz komandne linije */
     if (end == text || *end != '\0') {
-        fprintf(stderr, "Invalid %s: %s\n", name, text);
-        exit(EXIT_FAILURE);
+        fprintf(stderr, "Bad %s: %s\n", what, text);
+        exit(1);
     }
-    if (value < min_value || value > max_value) {
-        fprintf(stderr, "%s must be in range [%d, %d]\n", name, min_value, max_value);
-        exit(EXIT_FAILURE);
+    if (x < min || x > max) {
+        fprintf(stderr, "%s must be from %d to %d\n", what, min, max);
+        exit(1);
     }
-
-    return (int)value;
+    return (int)x;
 }
 
-static unsigned int next_rand(void) {
-    rng_state = rng_state * 1664525u + 1013904223u;
-    return rng_state;
+static unsigned char start_value(int pid, int page, int offset) {
+    /* da svaka stranica ima neki pocetni sadrzaj */
+    return (unsigned char)((pid * 53 + page * 31 + offset * 17 + 0x42) & 0xff);
 }
 
-static int rand_between(int min_value, int max_value) {
-    unsigned int span = (unsigned int)(max_value - min_value + 1);
-    return min_value + (int)(next_rand() % span);
-}
-
-static bool chance(int percent) {
-    return rand_between(1, 100) <= percent;
-}
-
-static unsigned char initial_value(int pid, int page, int offset) {
-    unsigned int value = (unsigned int)(pid * 53 + page * 31 + offset * 17 + 0x42);
-    return (unsigned char)(value & 0xffu);
-}
-
-static int alive_processes(void) {
-    int count = 0;
+static void print_mem(void) {
     int i;
-
-    for (i = 0; i < process_count; i++) {
-        if (processes[i].alive) {
-            count++;
-        }
-    }
-
-    return count;
-}
-
-static Process *pick_process(void) {
-    int alive = alive_processes();
-    int target;
-    int i;
-
-    if (alive == 0) {
-        return NULL;
-    }
-
-    target = rand_between(1, alive);
-    for (i = 0; i < process_count; i++) {
-        if (!processes[i].alive) {
-            continue;
-        }
-        target--;
-        if (target == 0) {
-            return &processes[i];
-        }
-    }
-
-    return NULL;
-}
-
-static void print_frames(void) {
-    int i;
-
+    /* trenutno stanje okvira u RAM-u */
     printf("frames:");
-    for (i = 0; i < frame_count; i++) {
-        if (frames[i].occupied) {
-            printf(" %d:[%d:%d]", i, frames[i].pid, frames[i].page);
+    for (i = 0; i < m; i++) {
+        if (memory_frames[i].used) {
+            printf(" %d:[%d:%d]", i, memory_frames[i].pid, memory_frames[i].page);
         } else {
             printf(" %d:[-:-]", i);
         }
@@ -143,256 +95,254 @@ static void print_frames(void) {
     printf("\n");
 }
 
-static void print_clock(const char *label) {
-    int i;
-
-    printf("%s", label);
-    for (i = 0; i < frame_count; i++) {
-        if (i > 0) {
-            printf("-");
-        }
-        printf("%d", clock_bits[i]);
-    }
-    printf("\n");
-}
-
-static void print_hand(const char *label) {
-    int i;
-
-    printf("%s", label);
-    for (i = 0; i < clock_hand * 2; i++) {
-        printf(" ");
-    }
-    printf("^\n");
-}
-
-static void print_page_tables(void) {
-    int i;
-    int page;
-
-    for (i = 0; i < process_count; i++) {
-        Process *proc = &processes[i];
-
-        printf("pt[%d]:", proc->pid);
-        if (!proc->alive) {
+static void print_pt(void) {
+    int i, j;
+    /* tablice stranica za sve procese */
+    for (i = 0; i < n; i++) {
+        printf("pt[%d]:", processes[i].pid);
+        if (!processes[i].alive) {
             printf(" terminated");
         }
-        for (page = 0; page < MAX_VPAGES; page++) {
-            if (page >= proc->allocated_pages) {
-                printf(" %d:NA", page);
-            } else if (proc->pages[page].present) {
-                printf(" %d:F%d", page, proc->pages[page].frame);
+        for (j = 0; j < MAX_PAGES; j++) {
+            if (j >= processes[i].num_pages) {
+                printf(" %d:NA", j);
+            } else if (processes[i].page_table[j].present) {
+                printf(" %d:F%d", j, processes[i].page_table[j].frame);
             } else {
-                printf(" %d:D", page);
+                printf(" %d:D", j);
             }
         }
         printf("\n");
     }
 }
 
-static void print_state(void) {
-    print_frames();
-    print_page_tables();
+static void print_clock_state(const char *text) {
+    int i;
+    printf("%s", text);
+    for (i = 0; i < m; i++) {
+        if (i > 0) {
+            printf("-");
+        }
+        printf("%d", clock_ref[i]);
+    }
+    printf("\n");
 }
 
-static void release_process_frames(Process *proc) {
+static void print_hand(const char *text) {
     int i;
+    printf("%s", text);
+    for (i = 0; i < hand * 2; i++) {
+        printf(" ");
+    }
+    printf("^\n");
+}
 
-    for (i = 0; i < frame_count; i++) {
-        if (!frames[i].occupied || frames[i].pid != proc->pid) {
+static int alive_count(void) {
+    int i;
+    int cnt = 0;
+
+    /* prebroji procese koji jos rade */
+    for (i = 0; i < n; i++) {
+        if (processes[i].alive) {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+/* oslobodi sve okvire od procesa */
+static void free_process_frames(Process *p) {
+    int i;
+    for (i = 0; i < m; i++) {
+        if (!memory_frames[i].used || memory_frames[i].pid != p->pid) {
             continue;
         }
-
-        if (frames[i].dirty) {
-            memcpy(proc->disk[frames[i].page], frames[i].data, PAGE_SIZE);
+        if (memory_frames[i].dirty) {
+            memcpy(p->disk[memory_frames[i].page], memory_frames[i].bytes, PAGE_SIZE);
         }
-
-        frames[i].occupied = false;
-        frames[i].dirty = false;
-        frames[i].pid = 0;
-        frames[i].page = 0;
-        memset(frames[i].data, 0, sizeof(frames[i].data));
-        clock_bits[i] = 0;
+        memory_frames[i].used = false;
+        memory_frames[i].dirty = false;
+        memory_frames[i].pid = 0;
+        memory_frames[i].page = 0;
+        memset(memory_frames[i].bytes, 0, PAGE_SIZE);
+        clock_ref[i] = 0;
     }
-
-    for (i = 0; i < proc->allocated_pages; i++) {
-        proc->pages[i].present = false;
-        proc->pages[i].frame = -1;
+    for (i = 0; i < p->num_pages; i++) {
+        p->page_table[i].present = false;
+        p->page_table[i].frame = -1;
     }
 }
 
-static int select_victim_frame(void) {
+/* clock algoritam */
+static int nadji_okvir(void) {
     while (1) {
-        if (!frames[clock_hand].occupied || clock_bits[clock_hand] == 0) {
-            int victim = clock_hand;
-
-            clock_hand = (clock_hand + 1) % frame_count;
-            return victim;
+        if (!memory_frames[hand].used || clock_ref[hand] == 0) {
+            int x = hand;
+            hand = (hand + 1) % m;
+            return x;
         }
-
-        clock_bits[clock_hand] = 0;
-        clock_hand = (clock_hand + 1) % frame_count;
+        clock_ref[hand] = 0;
+        hand = (hand + 1) % m;
     }
 }
 
-static void load_page_into_frame(Process *proc, int page, int frame_index) {
-    if (frames[frame_index].occupied) {
-        Process *old_proc = &processes[frames[frame_index].pid - 1];
-        int old_page = frames[frame_index].page;
-
-        if (frames[frame_index].dirty) {
-            memcpy(old_proc->disk[old_page], frames[frame_index].data, PAGE_SIZE);
+static void ubaci_stranicu(Process *p, int page, int frame_index) {
+    /* ako je okvir zauzet moramo izbaciti staru stranicu */
+    if (memory_frames[frame_index].used) {
+        int old_pid = memory_frames[frame_index].pid;
+        int old_page = memory_frames[frame_index].page;
+        if (memory_frames[frame_index].dirty) {
+            memcpy(processes[old_pid - 1].disk[old_page], memory_frames[frame_index].bytes, PAGE_SIZE);
         }
-        old_proc->pages[old_page].present = false;
-        old_proc->pages[old_page].frame = -1;
+        processes[old_pid - 1].page_table[old_page].present = false;
+        processes[old_pid - 1].page_table[old_page].frame = -1;
     }
 
-    frames[frame_index].occupied = true;
-    frames[frame_index].dirty = false;
-    frames[frame_index].pid = proc->pid;
-    frames[frame_index].page = page;
-    memcpy(frames[frame_index].data, proc->disk[page], PAGE_SIZE);
-
-    proc->pages[page].present = true;
-    proc->pages[page].frame = frame_index;
-    clock_bits[frame_index] = 1;
+    /* ucitaj novu stranicu u okvir */
+    memory_frames[frame_index].used = true;
+    memory_frames[frame_index].dirty = false;
+    memory_frames[frame_index].pid = p->pid;
+    memory_frames[frame_index].page = page;
+    memcpy(memory_frames[frame_index].bytes, p->disk[page], PAGE_SIZE);
+    p->page_table[page].present = true;
+    p->page_table[page].frame = frame_index;
+    clock_ref[frame_index] = 1;
 }
 
-static void print_access(const Process *proc, const Access *access) {
-    if (access->write) {
+static void print_request(Process *p, Request *r) {
+    /* ispis trenutnog zahtjeva */
+    if (r->write) {
         printf("process %d WRITE(0x%02X) LA=0x%02X%02X\n",
-               proc->pid, access->value, access->page, access->offset);
+               p->pid, r->value, r->page, r->offset);
     } else {
         printf("process %d READ LA=0x%02X%02X\n",
-               proc->pid, access->page, access->offset);
+               p->pid, r->page, r->offset);
     }
 }
 
-static void simulate_access(Process *proc, Access access) {
-    int physical_address;
+static void access_memory(Process *p, Request r) {
     int frame_index;
+    int physical;
 
-    print_access(proc, &access);
-
-    if (access.page >= proc->allocated_pages) {
-        printf("MEMORY FAULT: page %d not allocated, terminating process %d\n",
-               access.page, proc->pid);
-        proc->alive = false;
-        release_process_frames(proc);
-        print_state();
+    /* ispis sto proces trazi */
+    print_request(p, &r);
+    if (r.page >= p->num_pages) {
+        /* proces dira stranicu koja mu nije dodijeljena */
+        printf("MEMORY FAULT: page %d not allocated, terminating process %d\n", r.page, p->pid);
+        p->alive = false;
+        free_process_frames(p);
+        print_mem();
+        print_pt();
         printf("\n");
         return;
     }
-
-    print_state();
-
-    if (!proc->pages[access.page].present) {
+    print_mem();
+    print_pt();
+    if (!p->page_table[r.page].present) {
         int victim;
         bool replacing;
         int old_pid = 0;
         int old_page = 0;
         bool old_dirty = false;
 
-        printf("MISS (page %d not in memory)\n", access.page);
-        print_clock("clock before: ");
+        printf("MISS (page %d not in memory)\n", r.page);
+        print_clock_state("clock before: ");
         print_hand("hand before:  ");
 
-        victim = select_victim_frame();
-        replacing = frames[victim].occupied;
+        /* trazi slobodan okvir ili zrtvu */
+        victim = nadji_okvir();
+        replacing = memory_frames[victim].used;
         if (replacing) {
-            old_pid = frames[victim].pid;
-            old_page = frames[victim].page;
-            old_dirty = frames[victim].dirty;
+            old_pid = memory_frames[victim].pid;
+            old_page = memory_frames[victim].page;
+            old_dirty = memory_frames[victim].dirty;
         }
-
-        print_clock("clock after:  ");
+        print_clock_state("clock after:  ");
         print_hand("hand after:   ");
-
         if (replacing) {
             printf("use frame %d:\n", victim);
             if (old_dirty) {
+                /* dirty znaci da moramo spremiti nazad */
                 printf("- save to disk:   process %d, page %d\n", old_pid, old_page);
             } else {
                 printf("- discard clean:  process %d, page %d\n", old_pid, old_page);
             }
-            printf("- load from disk: process %d, page %d\n", proc->pid, access.page);
+            printf("- load from disk: process %d, page %d\n", p->pid, r.page);
         } else {
             printf("use free frame %d:\n", victim);
-            printf("- load from disk: process %d, page %d\n", proc->pid, access.page);
+            printf("- load from disk: process %d, page %d\n", p->pid, r.page);
         }
 
-        load_page_into_frame(proc, access.page, victim);
-        print_state();
+        ubaci_stranicu(p, r.page, victim);
+        print_mem();
+        print_pt();
+        /* nakon ucitavanja stranice instrukcija ide opet */
         printf("restarting instruction:\n");
-        simulate_access(proc, access);
+        access_memory(p, r);
         return;
     }
 
-    frame_index = proc->pages[access.page].frame;
-    clock_bits[frame_index] = 1;
-
+    /* ako je pogodak samo prevedi adresu */
+    frame_index = p->page_table[r.page].frame;
+    clock_ref[frame_index] = 1;
+    physical = (frame_index << OFFSET_BITS) | r.offset;
     printf("HIT: frame %d\n", frame_index);
-    physical_address = (frame_index << OFFSET_BITS) | access.offset;
     printf("paging: process %d, page=%d => frame=%d, 0x%02X%02X => 0x%04X\n",
-           proc->pid, access.page, frame_index, access.page, access.offset, physical_address);
-
-    if (access.write) {
-        frames[frame_index].data[access.offset] = access.value;
-        frames[frame_index].dirty = true;
-        printf("save (0x%02X) at 0x%04X\n", access.value, physical_address);
+           p->pid, r.page, frame_index, r.page, r.offset, physical);
+    if (r.write) {
+        /* write ide direktno u okvir pa stranica postaje dirty */
+        memory_frames[frame_index].bytes[r.offset] = r.value;
+        memory_frames[frame_index].dirty = true;
+        printf("save (0x%02X) at 0x%04X\n", r.value, physical);
     } else {
         printf("read value at 0x%04X => 0x%02X\n",
-               physical_address, frames[frame_index].data[access.offset]);
+               physical, memory_frames[frame_index].bytes[r.offset]);
     }
 
-    print_clock("clock: ");
+    print_clock_state("clock: ");
     print_hand("hand:  ");
     printf("\n");
 }
 
-static Access make_access(Process *proc) {
-    Access access;
-    bool invalid = false;
+static Request make_request(Process *p) {
+    Request r;
+    bool bad_page = false;
 
-    if (proc->requests_generated >= 3 && proc->allocated_pages < MAX_VPAGES) {
-        invalid = chance(15);
+    /* nekad namjerno generiram krivu stranicu da se vidi fault */
+    if (p->requests >= 3 && p->num_pages < MAX_PAGES) {
+        bad_page = random_percent(15);
     }
-
-    access.write = chance(50);
-    access.offset = rand_between(0, PAGE_SIZE - 1);
-    access.value = (unsigned char)rand_between(0, 255);
-
-    if (invalid) {
-        access.page = rand_between(proc->allocated_pages, MAX_VPAGES - 1);
+    r.write = random_percent(50);
+    r.offset = random_between(0, PAGE_SIZE - 1);
+    r.value = (unsigned char)random_between(0, 255);
+    if (bad_page) {
+        r.page = random_between(p->num_pages, MAX_PAGES - 1);
     } else {
-        access.page = rand_between(0, proc->allocated_pages - 1);
+        r.page = random_between(0, p->num_pages - 1);
     }
-
-    proc->requests_generated++;
-    return access;
+    p->requests++;
+    return r;
 }
 
-static void init_simulation(void) {
-    int i;
-    int page;
-    int offset;
+static void setup(void) {
+    int i, j, k;
 
+    /* pocetno stanje svega je prazno */
     memset(processes, 0, sizeof(processes));
-    memset(frames, 0, sizeof(frames));
-    memset(clock_bits, 0, sizeof(clock_bits));
-    clock_hand = 0;
-
-    for (i = 0; i < process_count; i++) {
+    memset(memory_frames, 0, sizeof(memory_frames));
+    memset(clock_ref, 0, sizeof(clock_ref));
+    hand = 0;
+    for (i = 0; i < n; i++) {
         processes[i].pid = i + 1;
-        processes[i].allocated_pages = rand_between(2, MAX_VPAGES - 1);
+        processes[i].num_pages = random_between(2, MAX_PAGES - 1);
         processes[i].alive = true;
-        processes[i].requests_generated = 0;
-
-        for (page = 0; page < MAX_VPAGES; page++) {
-            processes[i].pages[page].present = false;
-            processes[i].pages[page].frame = -1;
-            for (offset = 0; offset < PAGE_SIZE; offset++) {
-                processes[i].disk[page][offset] = initial_value(processes[i].pid, page, offset);
+        processes[i].requests = 0;
+        for (j = 0; j < MAX_PAGES; j++) {
+            processes[i].page_table[j].present = false;
+            processes[i].page_table[j].frame = -1;
+            for (k = 0; k < PAGE_SIZE; k++) {
+                /* stavi nesto na "disk" */
+                processes[i].disk[j][k] = start_value(processes[i].pid, j, k);
             }
         }
     }
@@ -400,52 +350,67 @@ static void init_simulation(void) {
 
 int main(int argc, char *argv[]) {
     int steps = 20;
-    int step;
-    unsigned int default_seed = (unsigned int)time(NULL);
-    unsigned int initial_seed;
+    int i, j;
+    unsigned int seed;
+    Process *p;
+    int zivi;
+    int trazeni;
+    int br;
 
     if (argc > 5) {
-        usage(argv[0]);
-        return EXIT_FAILURE;
+        print_usage(argv[0]);
+        return 1;
     }
 
-    rng_state = default_seed;
+    /* ako nema argumenta za seed uzmi trenutno vrijeme */
+    seed = (unsigned int)time(NULL);
     if (argc >= 2) {
-        rng_state = (unsigned int)parse_arg(argv[1], "seed", 0, 2147483647);
+        seed = (unsigned int)read_number(argv[1], 0, 2147483647, "seed");
     }
-    initial_seed = rng_state;
-
+    srand(seed);
     if (argc >= 3) {
-        steps = parse_arg(argv[2], "steps", 1, 200);
+        steps = read_number(argv[2], 1, 200, "steps");
     }
-
-    process_count = (argc >= 4) ? parse_arg(argv[3], "processes", 1, MAX_PROCESSES) : rand_between(3, MAX_PROCESSES);
-    frame_count = (argc >= 5) ? parse_arg(argv[4], "frames", 2, MAX_FRAMES) : rand_between(4, 8);
-
-    if (frame_count <= 0 || process_count <= 0) {
-        fail("Simulation configuration is invalid.");
+    if (argc >= 4) {
+        n = read_number(argv[3], 1, MAX_PROCESSES, "processes");
+    } else {
+        n = random_between(3, MAX_PROCESSES);
     }
-
-    init_simulation();
-
+    if (argc >= 5) {
+        m = read_number(argv[4], 2, MAX_FRAMES, "frames");
+    } else {
+        m = random_between(4, 8);
+    }
+    setup();
     printf("seed=%u steps=%d processes=%d frames=%d page-size=%dB\n",
-           initial_seed, steps, process_count, frame_count, PAGE_SIZE);
-    for (step = 0; step < process_count; step++) {
-        printf("process %d allocated pages: %d\n",
-               processes[step].pid, processes[step].allocated_pages);
+           seed, steps, n, m, PAGE_SIZE);
+    for (i = 0; i < n; i++) {
+        printf("process %d allocated pages: %d\n", processes[i].pid, processes[i].num_pages);
     }
     printf("\n");
-
-    for (step = 0; step < steps; step++) {
-        Process *proc = pick_process();
-
-        if (proc == NULL) {
+    for (i = 0; i < steps; i++) {
+        zivi = alive_count();
+        if (zivi == 0) {
             printf("All processes terminated.\n");
             break;
         }
 
-        simulate_access(proc, make_access(proc));
-    }
+        /* izaberi neki zivi proces */
+        trazeni = random_between(1, zivi);
+        p = NULL;
+        br = 0;
+        for (j = 0; j < n; j++) {
+            if (processes[j].alive) {
+                br++;
+                if (br == trazeni) {
+                    p = &processes[j];
+                    break;
+                }
+            }
+        }
 
-    return EXIT_SUCCESS;
+        /* jedan pristup memoriji */
+        access_memory(p, make_request(p));
+    }
+    return 0;
 }

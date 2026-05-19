@@ -498,27 +498,37 @@ structures.
 Output example:
 ```
 Frame print format: "frames: frame-num:[process-num:page] ..."
+Page table format: "pt[process]: page:Fframe | D | NA ..."
 Clock algorithm data format: "clock: frame0-A - frame1-A ..."
 In the following example offset is 8-bit wide (last 2 hex digit of address).
 
 process 3 READ LA=0x0234
 frames: 0:[2:0] 1:[1:2] 2:[1:3] 3:[3:0] 4:[2:3] 5:[3:1] 6:[3:2] 7:[1:0]
-HIT:                                                    ^^^^^^^
+pt[1]: 0:F7 1:D 2:F1 3:F2 4:NA 5:NA 6:NA 7:NA
+pt[2]: 0:F0 1:D 2:D 3:F4 4:NA 5:NA 6:NA 7:NA
+pt[3]: 0:F3 1:F5 2:F6 3:NA 4:NA 5:NA 6:NA 7:NA
+HIT: frame 6
 paging: process 3, page=2 => frame=6, 0x0234 => 0x0634
 read value at 0x0634 => 0x42       (0x42 must be written there before!)
 clock: 0-0-0-1-0-0-1-1
-hand         ^
+hand:             ^
 
 process 2 WRITE(0x73) LA=0x0321
 frames: 0:[2:0] 1:[1:2] 2:[1:3] 3:[3:0] 4:[2:3] 5:[3:1] 6:[3:2] 7:[1:0]
-HIT:                                    ^^^^^^^
+pt[1]: 0:F7 1:D 2:F1 3:F2 4:NA 5:NA 6:NA 7:NA
+pt[2]: 0:F0 1:D 2:D 3:F4 4:NA 5:NA 6:NA 7:NA
+pt[3]: 0:F3 1:F5 2:F6 3:NA 4:NA 5:NA 6:NA 7:NA
+HIT: frame 4
 paging: process 2, page=3 => frame=4, 0x0321 => 0x0421
 save (0x73) at 0x0421
 clock: 0-0-0-1-1-0-1-1
-hand         ^
+hand:             ^
 
 process 1 WRITE(0x37) LA=0x0101
 frames: 0:[2:0] 1:[1:2] 2:[1:3] 3:[3:0] 4:[2:3] 5:[3:1] 6:[3:2] 7:[1:0]
+pt[1]: 0:F7 1:D 2:F1 3:F2 4:NA 5:NA 6:NA 7:NA
+pt[2]: 0:F0 1:D 2:D 3:F4 4:NA 5:NA 6:NA 7:NA
+pt[3]: 0:F3 1:F5 2:F6 3:NA 4:NA 5:NA 6:NA 7:NA
 MISS (page 1 not in memory)
 clock before: 0-0-0-1-1-0-1-1
 hand before:        ^
@@ -528,11 +538,17 @@ use frame 5:
 - save to disk:   process 3, page 1
 - load from disk: process 1, page 1
 frames: 0:[2:0] 1:[1:2] 2:[1:3] 3:[3:0] 4:[2:3] 5:[1:1] 6:[3:2] 7:[1:0]
+pt[1]: 0:F7 1:F5 2:F1 3:F2 4:NA 5:NA 6:NA 7:NA
+pt[2]: 0:F0 1:D 2:D 3:F4 4:NA 5:NA 6:NA 7:NA
+pt[3]: 0:F3 1:D 2:F6 3:NA 4:NA 5:NA 6:NA 7:NA
 restarting instruction:
 process 1 WRITE(0x37) LA=0x0101
 frames: 0:[2:0] 1:[1:2] 2:[1:3] 3:[3:0] 4:[2:3] 5:[1:1] 6:[3:2] 7:[1:0]
-HIT:                                            ^^^^^^^
-paging: page=1 => frame=5, 0x0101 => 0x0501
+pt[1]: 0:F7 1:F5 2:F1 3:F2 4:NA 5:NA 6:NA 7:NA
+pt[2]: 0:F0 1:D 2:D 3:F4 4:NA 5:NA 6:NA 7:NA
+pt[3]: 0:F3 1:D 2:F6 3:NA 4:NA 5:NA 6:NA 7:NA
+HIT: frame 5
+paging: process 1, page=1 => frame=5, 0x0101 => 0x0501
 save (0x37) at 0x0501
 clock:  0-0-0-0-0-1-1-1
 hand:             ^
@@ -542,6 +558,5 @@ MEMORY FAULT: page 7 not allocated, terminating process 1
 ```
 
 Problem solution:
-does it
-- [paging.c](lab04/paging.c)
 
+- [paging.c](lab04/paging.c)
